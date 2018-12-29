@@ -35,6 +35,7 @@ Options:
 	-o path to generate image file ENV: IMAGE
 	-s Image size in MB ENV: IMG_SIZE
 	-r Free space of the root partition in MB ENV: ROOT_FREE_SPACE
+	-F Create image file for Firecracker
 
 Extra environment variables:
 	AGENT_BIN:  use it to change the expected agent binary name
@@ -56,8 +57,10 @@ MEM_BOUNDARY=128
 # Maximum no of attempts to create a root disk before giving up
 MAX_ATTEMPTS=5
 
+FIRECRACKER="no"
+
 ATTEMPT_NUM=0
-while getopts "ho:r:s:f:" opt
+while getopts "ho:r:s:f:F" opt
 do
 	case "$opt" in
 		h)	usage ;;
@@ -74,6 +77,7 @@ do
 		 }
 		 ;;
 		f)	FS_TYPE="${OPTARG}" ;;
+		F)	FIRECRACKER="yes" ;;
 	esac
 done
 
@@ -107,6 +111,7 @@ if [ -n "${USE_DOCKER}" ] ; then
 		--privileged \
 		--env IMG_SIZE="${IMG_SIZE}" \
 		--env AGENT_INIT=${AGENT_INIT} \
+		--env FIRECRACKER=${FIRECRACKER} \
 		-v /dev:/dev \
 		-v "${script_dir}":"/osbuilder" \
 		-v "${script_dir}/../scripts":"/scripts" \
@@ -197,20 +202,9 @@ detach()
 }
 
 
-create_rootfs_disk()
+create_rootfs_disk_normal()
 {
-	ATTEMPT_NUM=$(($ATTEMPT_NUM+1))
-	info "Create root disk image. Attempt ${ATTEMPT_NUM} out of ${MAX_ATTEMPTS}."
-	if [ ${ATTEMPT_NUM} -gt ${MAX_ATTEMPTS} ]; then
-		die "Unable to create root disk image."
-	fi
-
-	calculate_img_size
-	if [ ${OLD_IMG_SIZE} -ne 0 ]; then
-		info "Image size ${OLD_IMG_SIZE}MB too small, trying again with size ${IMG_SIZE}MB"
-	fi
-
-	info "Creating raw disk with size ${IMG_SIZE}M"
+    info "Creating raw disk with size ${IMG_SIZE}M"
 	qemu-img create -q -f raw "${IMAGE}" "${IMG_SIZE}M"
 	OK "Image file created"
 
@@ -269,6 +263,41 @@ create_rootfs_disk()
 	fi
 }
 
+create_rootfs_disk_firecracker()
+{
+    info "Creating raw disk for Firecracker with size ${IMG_SIZE}M"
+
+	truncate -s "${IMG_SIZE}M" "${IMAGE}"
+	OK "Image file created"
+
+	mkfs.ext4 -q -F -b "${BLOCK_SIZE}" "${IMAGE}"
+	OK "Image formatted"
+
+    mount -o loop "${IMAGE}" "${MOUNT_DIR}"
+    info "Mount root partition"
+}
+
+create_rootfs_disk()
+{
+	ATTEMPT_NUM=$(($ATTEMPT_NUM+1))
+	info "Create root disk image. Attempt ${ATTEMPT_NUM} out of ${MAX_ATTEMPTS}."
+	if [ ${ATTEMPT_NUM} -gt ${MAX_ATTEMPTS} ]; then
+		die "Unable to create root disk image."
+	fi
+
+	calculate_img_size
+	if [ ${OLD_IMG_SIZE} -ne 0 ]; then
+		info "Image size ${OLD_IMG_SIZE}MB too small, trying again with size ${IMG_SIZE}MB"
+	fi
+
+	if [ "${FIRECRACKER}" == "yes" ]
+	then
+		create_rootfs_disk_firecracker
+	else
+		create_rootfs_disk_normal
+	fi
+}
+
 create_rootfs_disk
 
 info "rootfs size ${ROOTFS_SIZE} MB"
@@ -277,8 +306,11 @@ cp -a "${ROOTFS}"/* ${MOUNT_DIR}
 OK "rootfs copied"
 
 unmount
-# Optimize
-fsck.ext4 -D -y "${DEVICE}p1"
-detach
+if [ "${FIRECRACKER}" == "no" ]
+then
+	# Optimize
+	fsck.ext4 -D -y "${DEVICE}p1"
+	detach
+fi
 
 info "Image created. Virtual size: ${IMG_SIZE}MB."
